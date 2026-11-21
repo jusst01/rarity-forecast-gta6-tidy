@@ -287,11 +287,16 @@ def live_rows(events, trophies, horizon_days, x_tgt):
     n_events = len(events)
     w = n_events / float(n_events + 6)
 
-    # Per-trophy earner slopes and event logit-rate residual spreads.
-    raw_slopes = []
-    rsds = []
-    last_rates = []
+    # Per-trophy earner slopes and event logit-rate residual spreads.  A pinned
+    # trophy skips steps 1-7 of the spec, so it contributes no slope to any
+    # group (its capped rate would otherwise lend the [50,100) band the
+    # player-growth slope itself and skew every trophy grouped with it).
+    last_rates = [last_rate_of(events[-1], i) for i in range(len(trophies))]
+    raw_slopes = [None] * len(trophies)
+    rsds = [0.12] * len(trophies)
     for i, _trophy in enumerate(trophies):
+        if last_rates[i] >= 99.99:
+            continue
         points_y = []
         y_logits = []
         for e in events:
@@ -299,18 +304,20 @@ def live_rows(events, trophies, horizon_days, x_tgt):
             earners = max(0.5, float(round_half_up(rate / 100.0 * e["n"])))
             points_y.append(math.log(earners))
             y_logits.append(logit_pct(max(rate, 0.01)))
-        raw_slopes.append(theil_sen(xs, points_y)[0])
+        raw_slopes[i] = theil_sen(xs, points_y)[0]
 
         b_r, a_r = theil_sen(xs, y_logits)
         resid = [y - (a_r + b_r * x) for x, y in zip(xs, y_logits)]
         rsd = math.sqrt(sum(r * r for r in resid) / len(resid)) if resid else 0.0
-        rsds.append(clamp(rsd, 0.12, 0.6))
-        last_rates.append(last_rate_of(events[-1], i))
+        rsds[i] = clamp(rsd, 0.12, 0.6)
 
-    global_median = median(raw_slopes) if raw_slopes else 0.0
+    fitted = [s for s in raw_slopes if s is not None]
+    global_median = median(fitted) if fitted else 0.0
 
     groups = {}
     for i, trophy in enumerate(trophies):
+        if raw_slopes[i] is None:
+            continue
         key = (str(trophy.get("tier", "")), band_key(last_rates[i]))
         groups.setdefault(key, []).append(raw_slopes[i])
     group_medians = {k: median(v) for k, v in groups.items()}
@@ -475,6 +482,41 @@ def forecast_case(case, name):
                                  for t in trophies]}
 
 
+def salvage_last_rates(text, n_trophies):
+    """Last readable rates from a malformed case file, or None.
+
+    History is decoded read by read from the first object that parses, so a
+    file truncated mid-history still yields its most recent complete read.
+    """
+    marker = '"history"'
+    pos = text.find(marker)
+    if pos < 0:
+        return None
+    brace = text.find("[", pos + len(marker))
+    if brace < 0:
+        return None
+    decoder = json.JSONDecoder()
+    tail = text[brace + 1:]
+    last = None
+    i = 0
+    while i < len(tail):
+        while i < len(tail) and tail[i] in " \t\r\n,":
+            i += 1
+        if i >= len(tail) or tail[i] == "]":
+            break
+        try:
+            value, end = decoder.raw_decode(tail, i)
+        except ValueError:
+            break
+        if isinstance(value, dict) and isinstance(value.get("rates"), list):
+            last = value["rates"]
+        i = end
+    if last is None:
+        return None
+    return [as_number(r, 0.0) if r is not None else 0.0
+            for r in last[:n_trophies]]
+
+
 def salvage_trophies(text):
     """Best-effort trophy list from a malformed case file."""
     marker = '"trophies"'
@@ -514,9 +556,11 @@ def main():
             if trophies is None:
                 forecast = {"trophies": []}
             else:
+                rates = salvage_last_rates(text, len(trophies)) or []
                 forecast = {"trophies": [
-                    {"id": t["id"], "q": persistence_row(0.0, 0.0)}
-                    for t in trophies]}
+                    {"id": t["id"],
+                     "q": persistence_row(rates[i] if i < len(rates) else 0.0, 0.0)}
+                    for i, t in enumerate(trophies)]}
 
         out_path.write_text(
             json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
